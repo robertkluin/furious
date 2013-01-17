@@ -17,10 +17,14 @@
 """
 Furious context may be used to group a collection of Async tasks together.
 
+NOTE: It is generally preferable to use the higher level helper method
+found in this package to instantiate contexts.
+
+
 Usage:
 
 
-    with context.new() as current_context:
+    with Context() as current_context:
         # An explicitly constructed Async object may be passed in.
         async_job = Async(some_function,
                           [args, for, other],
@@ -38,19 +42,81 @@ Usage:
 
 """
 
-import threading
 
-from google.appengine.api import taskqueue
+class ContextAlreadyStartedError(Exception):
+    """Attempt to set context on an Async that is already executing in a
+    context.
+    """
 
-_local_context = threading.local()
 
+class Context(object):
+    """Furious context object.
 
-def new():
-    """Get a new furious context and add it to the registry."""
-    _init()
-    new_context = Context()
-    _local_context.registry.append(new_context)
-    return new_context
+    NOTE: Use the module's new function to get a context, do not manually
+    instantiate.
+    """
+    def __init__(self, insert_tasks=None):
+        self._tasks = []
+
+        self.insert_tasks = insert_tasks or _insert_tasks
+
+        self._tasks_inserted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not exc_type and self._tasks:
+            self._handle_tasks()
+
+        return False
+
+    def _handle_tasks(self):
+        """Convert all Async's into tasks, then insert them into queues."""
+        if self._tasks_inserted:
+            raise ContextAlreadyStartedError(
+                "This Context has already had its tasks inserted.")
+
+        task_map = self._get_tasks_by_queue()
+        for queue, tasks in task_map.iteritems():
+            self.insert_tasks(tasks, queue=queue)
+
+        self._tasks_inserted = True
+
+    def _get_tasks_by_queue(self):
+        """Return the tasks for this Context, grouped by queue."""
+        task_map = {}
+
+        for async in self._tasks:
+            queue = async.get_queue()
+            task = async.to_task()
+            task_map.setdefault(queue, []).append(task)
+
+        return task_map
+
+    def add(self, target, args=None, kwargs=None, **options):
+        """Add an Async job to this context.
+
+        Takes an Async object or the argumnets to construct an Async
+        object as argumnets.  Returns the newly added Async object.
+        """
+        from ..async import Async
+
+        if self._tasks_inserted:
+            raise ContextAlreadyStartedError(
+                "This Context has already had its tasks inserted.")
+
+        if not isinstance(target, Async):
+            target = Async(target, args, kwargs, **options)
+
+        self._tasks.append(target)
+
+        return target
+
+    def start(self):
+        """Insert this Context's tasks executing."""
+        if self._tasks:
+            self._handle_tasks()
 
 
 def _insert_tasks(tasks, queue, transactional=False):
@@ -58,6 +124,8 @@ def _insert_tasks(tasks, queue, transactional=False):
     during insertion, split the batch and retry until they are successfully
     inserted.
     """
+    from google.appengine.api import taskqueue
+
     if not tasks:
         return
 
@@ -72,68 +140,4 @@ def _insert_tasks(tasks, queue, transactional=False):
 
         _insert_tasks(tasks[:count / 2], queue, transactional)
         _insert_tasks(tasks[count / 2:], queue, transactional)
-
-
-class Context(object):
-    """Furious context object.
-
-    NOTE: Use the module's new function to get a context, do not manually
-    instantiate.
-    """
-    def __init__(self, insert_tasks=_insert_tasks):
-        self._tasks = []
-        self.insert_tasks = insert_tasks
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._tasks:
-            self._handle_tasks()
-
-        return False
-
-    def _handle_tasks(self):
-        """Convert all Async's into tasks, then insert them into queues."""
-        task_map = self._get_tasks_by_queue()
-        for queue, tasks in task_map.iteritems():
-            self.insert_tasks(tasks, queue=queue)
-
-    def _get_tasks_by_queue(self):
-        """Return the tasks for this Context, grouped by queue."""
-        task_map = {}
-        for async in self._tasks:
-            queue = async.get_queue()
-            task = async.to_task()
-            task_map.setdefault(queue, []).append(task)
-        return task_map
-
-    def add(self, target, args=None, kwargs=None, **options):
-        """Add an Async job to this context.
-
-        Takes an Async object or the argumnets to construct an Async
-        object as argumnets.  Returns the newly added Async object.
-        """
-        from .async import Async
-        if not isinstance(target, Async):
-            target = Async(target, args, kwargs, **options)
-
-        self._tasks.append(target)
-        return target
-
-
-def _init():
-    """Initialize the furious context and registry.
-
-    NOTE: Do not directly run this method.
-    """
-    if hasattr(_local_context, '_initialized'):
-        return
-
-    _local_context.registry = []
-    _local_context._initialized = True
-
-    return _local_context
-
-_init()  # Initialize the context objects.
 
